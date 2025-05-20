@@ -56,6 +56,31 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+async def retry_call(func, *args, attempts=3, delay=1, context="", **kwargs):
+    """
+    Calls an async function with retries.
+
+    Args:
+        func (Callable): An async function.
+        *args: Positional arguments to pass to func.
+        attempts (int): Number of retries.
+        delay (int): Delay between attempts in seconds.
+        context (str): Context description for logging.
+        **kwargs: Keyword arguments to pass to func.
+
+    Returns:
+        The result of func(*args, **kwargs) or None if all attempts fail.
+    """
+    for attempt in range(attempts):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            tplr.logger.error(
+                f"Attempt {attempt + 1}/{attempts} failed for {context}: {e}"
+            )
+            await asyncio.sleep(delay)
+    tplr.logger.error(f"Failed to complete {context} after {attempts} attempts.")
+    return None
 
 class AdamBaseline:
     """
@@ -95,6 +120,8 @@ class AdamBaseline:
                             help='Compression topk for DeMo optimizer')
         parser.add_argument('--compression_chunk', type=int, default=64,
                             help='Compression chunk size for DeMo optimizer')
+        parser.add_argument('--use_quantization', action='store_true',
+                            help='Enable 8-bit quantization for gradient compression in DeMo optimizer')
         
         # Dataset args
 
@@ -180,8 +207,11 @@ class AdamBaseline:
                 compression_decay=self.config.compression_decay,
                 compression_topk=self.config.compression_topk,
                 compression_chunk=self.config.compression_chunk,
-                process_group=dist.group.WORLD if self.world_size > 1 else None
+                process_group=dist.group.WORLD if self.world_size > 1 else None,
+                use_quantization=self.config.use_quantization
             )
+            if self.config.use_quantization:
+                tplr.logger.info("Enabled 8-bit quantization for gradient compression")
 
         else:
             tplr.logger.info("Using AdamW optimizer")
@@ -253,14 +283,14 @@ class AdamBaseline:
             
             seed = random.randint(0, 100000)
             # Get deterministic pages for this window
-            pages = await tplr.r2_dataset.R2DatasetLoader.next_pages(
+            pages = await retry_call(tplr.r2_dataset.R2DatasetLoader.next_pages,
                 offset=window,
                 n_pages=self.hparams.pages_per_window,
                 seed=seed
             )
             
             # Create data loader
-            loader = await tplr.r2_dataset.R2DatasetLoader.create(
+            loader = await retry_call(tplr.r2_dataset.R2DatasetLoader.create,
                 batch_size=self.hparams.batch_size,
                 sequence_length=self.hparams.sequence_length,
                 pages_info=pages,
@@ -414,6 +444,16 @@ class AdamBaseline:
                         "baseline/data_transmit": self.optimizer.data_transmit / 1024**2,  # MB
                         "baseline/data_receive": self.optimizer.data_receive / 1024**2,  # MB
                     })
+                    
+                    # Add quantization metrics if enabled - use 1 instead of True for better W&B compatibility
+                    if self.config.use_quantization:
+                        metrics_dict.update({
+                            "baseline/quantization_enabled": 1,  # Use numeric value instead of boolean
+                        })
+                    else:
+                        metrics_dict.update({
+                            "baseline/quantization_enabled": 0,  # Use numeric value instead of boolean
+                        })
                 
                 self.wandb.log(metrics_dict, step=self.global_step)
                 

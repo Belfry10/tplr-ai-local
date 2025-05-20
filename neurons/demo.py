@@ -1,4 +1,3 @@
-
 """DeMo: Decoupled Momentum Optimization
 
 This implements the DeMo fused optimizer and data parallel algorithm.
@@ -25,6 +24,7 @@ class DeMo(torch.optim.SGD):
         compression_chunk: int = 64,
         weight_decay: float = 0.0,
         process_group: Optional[dist.ProcessGroup] = None,
+        use_quantization: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -43,6 +43,7 @@ class DeMo(torch.optim.SGD):
         self.compression_topk = compression_topk
         self.process_group = process_group
         self.weight_decay = weight_decay
+        self.use_quantization = use_quantization
 
         if self.compression_topk <= 0:
             raise ValueError("topk_size has to be positive")
@@ -59,7 +60,7 @@ class DeMo(torch.optim.SGD):
 
         self.default_dtype = self._find_dtype()
         self.transform = TransformDCT(self.param_groups, self.compression_chunk)
-        self.compress = CompressDCT()
+        self.compress = CompressDCT(use_quantization=self.use_quantization)
 
     def _find_dtype(self):
         for group in self.param_groups:
@@ -131,14 +132,15 @@ class DeMo(torch.optim.SGD):
                 # Add delta to new gradient
                 state["delta"].add_(p.grad, alpha=lr)
 
+                no_dct = False
                 # Compress delta
-                sparse_idx, sparse_val, xshape, totalk = self.compress.compress(
-                    self.transform.encode(state["delta"]), self.compression_topk
+                sparse_idx, sparse_val, xshape, totalk, quant_params = self.compress.compress(
+                    self.transform.encode(state["delta"], no_dct=no_dct), self.compression_topk
                 )
 
                 # Estimate transmitted delta
                 transmit_grad = self.transform.decode(
-                    self.compress.decompress(p, sparse_idx, sparse_val, xshape, totalk)
+                    self.compress.decompress(p, sparse_idx, sparse_val, xshape, totalk, quant_params),no_dct=no_dct
                 )
 
                 # Remove transmitted from delta
@@ -154,7 +156,7 @@ class DeMo(torch.optim.SGD):
 
                 # Decode grad from all nodes
                 new_grad = self.transform.decode(
-                    self.compress.batch_decompress(p, sparse_idx_gather, sparse_val_gather, xshape, totalk)
+                    self.compress.batch_decompress(p, sparse_idx_gather, sparse_val_gather, xshape, totalk, quant_params), no_dct=no_dct
                 )
 
                 # Set grad to values
@@ -212,8 +214,9 @@ class TransformDCT:
             return torch.einsum("...ijkl, kb, ld -> ...ibjd", x, b, d)
 
     @torch.no_grad()
-    def encode(self, x):
+    def encode(self, x, no_dct=False):
         if len(x.shape) > 1:  # 2D weights
+            
             n1 = self.shape_dict[x.shape[0]]
             n2 = self.shape_dict[x.shape[1]]
             n1w = self.f_dict[n1].to(x.device)
@@ -222,6 +225,8 @@ class TransformDCT:
             self.f_dict[n2] = n2w
 
             x = rearrange(x, "(y h) (x w) -> y h x w", h=n1, w=n2)
+            if no_dct:
+                return x
             x = self.einsum_2d(x, n1w, n2w)
 
         else:  # 1D weights
@@ -230,29 +235,36 @@ class TransformDCT:
             self.f_dict[n1] = n1w
 
             x = rearrange(x, "(x w) -> x w", w=n1)
+            if no_dct:
+                return x
             x = self.einsum_2d(x, n1w)
 
         return x
 
     @torch.no_grad()
-    def decode(self, x):
+    def decode(self, x, no_dct=False):
         if len(x.shape) > 2:  # 2D weights
+        
             n1 = x.shape[2]
             n2 = x.shape[3]
-            n1w = self.b_dict[n1].to(x.device)
-            n2w = self.b_dict[n2].to(x.device)
-            self.b_dict[n1] = n1w
-            self.b_dict[n2] = n2w
-
-            x = self.einsum_2d_t(x, n1w, n2w)
+            
+            if not no_dct:
+                n1w = self.b_dict[n1].to(x.device)
+                n2w = self.b_dict[n2].to(x.device)
+                self.b_dict[n1] = n1w
+                self.b_dict[n2] = n2w
+                x = self.einsum_2d_t(x, n1w, n2w)
+            
             x = rearrange(x, "y h x w -> (y h) (x w)")
 
         else:  # 1D weights
             n1 = x.shape[1]
-            n1w = self.b_dict[n1].to(x.device)
-            self.b_dict[n1] = n1w
-
-            x = self.einsum_2d_t(x, n1w)
+            
+            if not no_dct:
+                n1w = self.b_dict[n1].to(x.device)
+                self.b_dict[n1] = n1w
+                x = self.einsum_2d_t(x, n1w)
+            
             x = rearrange(x, "x w -> (x w)")
 
         return x
@@ -260,8 +272,10 @@ class TransformDCT:
 
 class CompressDCT:
     @torch.no_grad()
-    def __init__(self):
-        pass
+    def __init__(self, use_quantization=False):
+        self.use_quantization = use_quantization
+        self.n_bins = 256  # 8-bit quantization
+        self.RANGE_IN_SIGMAS = 6  # Quantization range in standard deviations
 
     def _clamp_topk(self, x, topk):
         if topk > x.shape[-1]:
@@ -282,11 +296,64 @@ class CompressDCT:
 
         idx = torch.topk(x.abs(), k=topk, dim=-1, largest=True, sorted=False).indices
         val = torch.gather(x, dim=-1, index=idx)
-
+        
+        # Apply 8-bit quantization if enabled
+        if self.use_quantization:
+            # Statistical quantization approach
+            offset = self.n_bins // 2  # 128 for 8-bit
+            shift = val.mean()
+            
+            # Center tensor around mean
+            centered_val = val - shift
+            
+            # Calculate standard deviation (unbiased)
+            std_unbiased = centered_val.norm() / math.sqrt(centered_val.numel() - 1)
+            
+            # Compute scale factor based on standard deviation range
+            scale = self.RANGE_IN_SIGMAS * std_unbiased / self.n_bins
+            
+            # Ensure scale is not zero to avoid NaN
+            if scale == 0 or torch.isnan(scale) or torch.isinf(scale):
+                scale = 1.0
+            
+            # Quantize to 8-bit representation
+            # First to float32 to ensure precision during division
+            centered_val = centered_val.to(torch.float32)
+            quantized_val = (centered_val / scale + offset).round().clamp(0, 255).to(torch.uint8)
+            
+            # Create lookup table by computing mean values for each bucket
+            # This creates more accurate reconstruction
+            lookup = torch.zeros(256, dtype=torch.float32, device=val.device)
+            for i in range(256):
+                mask = (quantized_val == i)
+                if mask.any():
+                    lookup[i] = centered_val[mask].mean()
+            
+            # Store quantization parameters for dequantization
+            orig_dtype = val.dtype
+            quant_params = (shift, scale, offset, lookup, orig_dtype)
+            
+            return idx, quantized_val, xshape, totalk, quant_params
+        
         return idx, val, xshape, totalk
 
     @torch.no_grad()
-    def decompress(self, p, idx, val, xshape, totalk):
+    def decompress(self, p, idx, val, xshape, totalk, quantize_params=None):
+        # Dequantize if values were quantized
+        if self.use_quantization and quantize_params is not None:
+            shift, scale, offset, lookup, orig_dtype = quantize_params
+            
+            # Convert quantized values back using lookup table
+            dequantized = torch.zeros_like(val, dtype=torch.float32)
+            for i in range(256):
+                mask = (val == i)
+                if mask.any():
+                    dequantized[mask] = lookup[i]
+            
+            # Apply scale and shift to get back original distribution
+            val = dequantized + shift
+            val = val.to(orig_dtype)
+            
         x = torch.zeros(xshape, device=p.device, dtype=p.dtype)
 
         if len(xshape) > 2:  # 2D weights
@@ -301,10 +368,10 @@ class CompressDCT:
         return x
 
     @torch.no_grad()
-    def batch_decompress(self, p, idx, val, xshape, totalk):
+    def batch_decompress(self, p, idx, val, xshape, totalk, quantize_params=None):
         idx = torch.concatenate(idx, dim=-1).to(device=p.device)
         val = torch.concatenate(val, dim=-1).to(device=p.device)
-        return self.decompress(p, idx, val, xshape, totalk)
+        return self.decompress(p, idx, val, xshape, totalk, quantize_params)
 
 
 # Code modified and sourced from https://github.com/zh217/torch-dct
